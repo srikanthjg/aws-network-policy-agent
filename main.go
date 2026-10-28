@@ -89,8 +89,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	runtimeOpts := config.BuildRuntimeOptions(ctrlConfig.RuntimeConfig, scheme)
-	mgr, err := ctrl.NewManager(restCFG, runtimeOpts)
+	mgr, err := ctrl.NewManager(restCFG, buildManagerOptions(ctrlConfig.RuntimeConfig))
 	if err != nil {
 		log.Errorf("unable to create controller manager %v", err)
 		os.Exit(1)
@@ -192,6 +191,13 @@ func main() {
 		os.Exit(1)
 	}
 
+}
+
+// buildManagerOptions returns the controller-runtime options with the trimmed PolicyEndpoint cache.
+func buildManagerOptions(rtCfg config.RuntimeConfig) ctrl.Options {
+	opts := config.BuildRuntimeOptions(rtCfg, scheme)
+	opts.Cache = controllers.CacheOptions()
+	return opts
 }
 
 // loadControllerConfig loads the controller configuration
