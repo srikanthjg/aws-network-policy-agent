@@ -2,12 +2,26 @@ package ebpf
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
 
 	"github.com/aws/aws-ebpf-sdk-go/pkg/maps"
+	"golang.org/x/sys/unix"
 )
+
+// maxReportedMapErrors bounds how many per-entry failures BulkRefresh logs and
+// returns, so a systemic errno does not produce one log line and error per entry.
+const maxReportedMapErrors = 8
+
+// mapEntryWriter is the subset of the SDK map BulkRefresh writes through.
+type mapEntryWriter interface {
+	UpdateMapEntry(key, value uintptr) error
+	DeleteMapEntry(key uintptr) error
+}
 
 // InMemoryBpfMap provides an in-memory representation of an eBPF map
 // with synchronized updates to the underlying kernel map
@@ -18,6 +32,45 @@ type InMemoryBpfMap struct {
 	contents map[string][]byte
 	// Mutex for thread safety
 	mutex sync.RWMutex
+	// ops overrides bpfMap for writes; nil means bpfMap. Set by tests.
+	ops mapEntryWriter
+}
+
+func (m *InMemoryBpfMap) writer() mapEntryWriter {
+	if m.ops != nil {
+		return m.ops
+	}
+	return m.bpfMap
+}
+
+// isNotExist reports whether err is ENOENT. The SDK formats the errno with %s
+// instead of wrapping it, so only its text survives.
+func isNotExist(err error) bool {
+	return err != nil && strings.Contains(err.Error(), unix.ENOENT.Error())
+}
+
+// mapErrors collects per-entry failures, keeping only the first few.
+type mapErrors struct {
+	errs    []error
+	dropped int
+}
+
+func (e *mapErrors) add(err error) {
+	if len(e.errs) < maxReportedMapErrors {
+		log().Errorf("%v", err)
+		e.errs = append(e.errs, err)
+		return
+	}
+	e.dropped++
+}
+
+func (e *mapErrors) count() int { return len(e.errs) + e.dropped }
+
+func (e *mapErrors) err() error {
+	if e.dropped > 0 {
+		e.errs = append(e.errs, fmt.Errorf("%d more map operation(s) failed", e.dropped))
+	}
+	return errors.Join(e.errs...)
 }
 
 // newInMemoryBpfMap is the constructor shadowMapForLocked uses. It is a variable so
@@ -109,37 +162,38 @@ func (m *InMemoryBpfMap) BulkRefresh(newMapContents map[string][]byte) error {
 		}
 	}
 
-	// Apply updates to kernel
+	// Every add and every delete is attempted, so one failure neither skips the
+	// stale-entry sweep nor is reported as success. Failed entries stay out of
+	// sync in the shadow map and are retried by the next refresh.
+	var failures mapErrors
+	writer := m.writer()
 	for k, v := range toAdd {
 		keyByte := []byte(k)
 		keyPtr := uintptr(unsafe.Pointer(&keyByte[0]))
 		valuePtr := uintptr(unsafe.Pointer(&v[0]))
 
-		if err := m.bpfMap.UpdateMapEntry(keyPtr, valuePtr); err != nil {
-			log().Errorf("Failed to update kernel map during bulk refresh for key %s: %v", k, err)
-			return err
+		if err := writer.UpdateMapEntry(keyPtr, valuePtr); err != nil {
+			sdkAPIErr.WithLabelValues("bulkRefresh-update").Inc()
+			failures.add(fmt.Errorf("update kernel map entry %x: %w", keyByte, err))
+			continue
 		}
-
-		// Update in-memory after successful kernel update
 		m.contents[k] = v
 	}
 
-	// Apply deletes to kernel
 	for _, k := range toDelete {
 		keyByte := []byte(k)
 		keyPtr := uintptr(unsafe.Pointer(&keyByte[0]))
 
-		if err := m.bpfMap.DeleteMapEntry(keyPtr); err != nil {
-			log().Errorf("Failed to delete from kernel map for key %s: %v", k, err)
-			// Continue with other deletions
-		} else {
-			// Remove from in-memory if kernel delete operation is successful
-			delete(m.contents, k)
+		if err := writer.DeleteMapEntry(keyPtr); err != nil && !isNotExist(err) {
+			sdkAPIErr.WithLabelValues("bulkRefresh-delete").Inc()
+			failures.add(fmt.Errorf("delete kernel map entry %x: %w", keyByte, err))
+			continue
 		}
+		delete(m.contents, k)
 	}
 
-	log().Infof("Bulk refresh: added/updated %d entries, deleted %d entries", len(toAdd), len(toDelete))
-	return nil
+	log().Infof("Bulk refresh: added/updated %d entries, deleted %d entries, failed %d", len(toAdd), len(toDelete), failures.count())
+	return failures.err()
 }
 
 // GetUnderlyingMap returns the underlying BpfMap

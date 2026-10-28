@@ -19,6 +19,7 @@ package controllers
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -33,15 +34,29 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	networking "k8s.io/api/networking/v1"
 )
 
 func log() logger.Logger {
 	return logger.Get()
+}
+
+// Retry backoff for a reconcile that failed to program eBPF maps. The
+// controller-runtime default caps at 1000s, longer than the outage in #686.
+const (
+	programmingRetryBaseDelay = 100 * time.Millisecond
+	programmingRetryMaxDelay  = 2 * time.Minute
+)
+
+func newProgrammingRateLimiter() workqueue.TypedRateLimiter[reconcile.Request] {
+	return workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](programmingRetryBaseDelay, programmingRetryMaxDelay)
 }
 
 const (
@@ -266,6 +281,7 @@ func (r *PolicyEndpointsReconciler) reconcilePolicyEndpoint(ctx context.Context,
 	}
 
 	programmingSucceeded := true
+	var programmingErr error
 	for podIdentifier := range podIdentifiers {
 		// Derive Ingress IPs from the PolicyEndpoint
 		ingressRules, egressRules, isIngressIsolated, isEgressIsolated, err := r.deriveIngressAndEgressFirewallRules(ctx, podIdentifier,
@@ -292,6 +308,7 @@ func (r *PolicyEndpointsReconciler) reconcilePolicyEndpoint(ctx context.Context,
 		if err != nil {
 			log().Errorf("Error configuring eBPF Probes %v", err)
 			programmingSucceeded = false
+			programmingErr = errors.Join(programmingErr, fmt.Errorf("podIdentifier %s: %w", podIdentifier, err))
 		}
 		duration := msSince(start)
 		policySetupLatency.WithLabelValues(policyEndpoint.Name, policyEndpoint.Namespace).Observe(duration)
@@ -300,7 +317,7 @@ func (r *PolicyEndpointsReconciler) reconcilePolicyEndpoint(ctx context.Context,
 	// Observe E2E policy programming latency (NPC change → NPA eBPF programmed)
 	r.observePolicyProgrammingLatency(policyEndpoint, programmingSucceeded)
 
-	return nil
+	return programmingErr
 }
 
 // observePolicyProgrammingLatency emits the E2E latency histogram from the
@@ -772,6 +789,7 @@ func (r *PolicyEndpointsReconciler) addCatchAllEntry(firewallRules *[]fwrp.EbpfF
 func (r *PolicyEndpointsReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&policyk8sawsv1.PolicyEndpoint{}).
+		WithOptions(controller.Options{RateLimiter: newProgrammingRateLimiter()}).
 		Complete(r)
 }
 

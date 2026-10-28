@@ -34,7 +34,9 @@ type MockBpfClient struct {
 
 	// Injected errors for failure-path tests. Zero values preserve the
 	// original success-path behavior, so existing tests continue to pass.
-	UpdateEbpfMapsErr                     error
+	UpdateEbpfMapsErr error
+	// UpdateEbpfMapsErrFor fails UpdateEbpfMaps for the named podIdentifiers only.
+	UpdateEbpfMapsErrFor                  map[string]error
 	UpdateClusterPolicyEbpfMapsErr        error
 	UpdatePodStateEbpfMapsErr             error
 	CreatePodStateEbpfEntryIfNotExistsErr error
@@ -159,6 +161,9 @@ func (m *MockBpfClient) UpdateEbpfMaps(podIdentifier string, ingressFirewallRule
 	}
 	if m.UpdateEbpfMapsErr != nil {
 		return m.UpdateEbpfMapsErr
+	}
+	if err := m.UpdateEbpfMapsErrFor[podIdentifier]; err != nil {
+		return err
 	}
 	m.LastIngressRules = ingressFirewallRules
 	m.LastEgressRules = egressFirewallRules
